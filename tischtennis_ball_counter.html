@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Tischtennis Ball Counter</title>
+<style>
+  :root { --bg:#0b1020; --panel:#151d33; --text:#f4f7ff; --muted:#aeb8d0; --accent:#55d6ff; --danger:#ff667d; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  main{max-width:1000px;margin:auto;padding:16px}
+  h1{font-size:clamp(24px,5vw,40px);margin:4px 0 8px}
+  p{color:var(--muted);margin:0 0 16px}
+  .layout{display:grid;grid-template-columns:1fr 320px;gap:16px}
+  .card{background:var(--panel);border:1px solid #263252;border-radius:18px;padding:14px}
+  .stage{position:relative;overflow:hidden;border-radius:14px;background:#000;aspect-ratio:16/9}
+  video{width:100%;height:100%;object-fit:cover;display:block;transform:scaleX(-1)}
+  canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;transform:scaleX(-1)}
+  .score{font-size:76px;font-weight:800;line-height:1;text-align:center;margin:10px 0 4px}
+  .record{text-align:center;color:var(--muted);margin-bottom:16px}
+  button{width:100%;border:0;border-radius:12px;padding:13px 14px;margin:5px 0;font-size:16px;font-weight:700;cursor:pointer;background:#283655;color:white}
+  button.primary{background:var(--accent);color:#05121a}
+  button.danger{background:#4a2030}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  label{display:flex;align-items:center;justify-content:space-between;gap:10px;color:var(--muted);margin:12px 0}
+  input[type=range]{width:55%}
+  .status{background:#0e1528;border-radius:10px;padding:10px;color:var(--muted);font-size:14px;line-height:1.4}
+  .hint{font-size:13px;line-height:1.45;color:var(--muted)}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--danger);margin-right:7px}
+  .dot.on{background:#5cff8c}
+  @media(max-width:800px){.layout{grid-template-columns:1fr}.score{font-size:62px}}
+</style>
+</head>
+<body>
+<main>
+  <h1>🏓 Tischtennis Ball Counter</h1>
+  <p>Der Counter versucht, den Ballkontakt mit dem Schläger über die Kamerabewegung zu erkennen.</p>
+
+  <div class="layout">
+    <section class="card">
+      <div class="stage">
+        <video id="video" playsinline autoplay muted></video>
+        <canvas id="overlay"></canvas>
+      </div>
+    </section>
+
+    <aside class="card">
+      <div class="score" id="score">0</div>
+      <div class="record">Rekord: <b id="record">0</b></div>
+
+      <button id="start" class="primary">Kamera starten</button>
+      <button id="reset" class="danger">Zähler zurücksetzen</button>
+      <button id="calibrate" disabled>Bereich kalibrieren</button>
+
+      <label>
+        Empfindlichkeit
+        <input id="sensitivity" type="range" min="1" max="10" value="5">
+      </label>
+
+      <div class="status" id="status"><span class="dot"></span> Kamera nicht gestartet</div>
+
+      <p class="hint">
+        Tipp: Stelle das Handy so auf, dass Schläger und Ball gut sichtbar sind.
+        Ein ruhiger, möglichst einfarbiger Hintergrund verbessert die Erkennung.
+        Für eine zuverlässige Zählung sollte der Ball deutlich sichtbar sein.
+      </p>
+    </aside>
+  </div>
+</main>
+
+<script>
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d', {willReadFrequently:true});
+const scoreEl = document.getElementById('score');
+const recordEl = document.getElementById('record');
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('start');
+const resetBtn = document.getElementById('reset');
+const calibrateBtn = document.getElementById('calibrate');
+const sensitivity = document.getElementById('sensitivity');
+
+let stream = null, running = false, raf = 0;
+let score = 0;
+let record = Number(localStorage.getItem('tt_counter_record') || 0);
+recordEl.textContent = record;
+
+let prevFrame = null;
+let prevCandidate = null;
+let lastContact = 0;
+let lastY = null;
+let direction = 0;
+let upDownEvents = 0;
+let roi = {x:0.15,y:0.05,w:0.70,h:0.82};
+
+function setStatus(text, on=false) {
+  statusEl.innerHTML = `<span class="dot ${on?'on':''}"></span>${text}`;
+}
+
+function resizeCanvas() {
+  if (!video.videoWidth) return;
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+}
+video.addEventListener('loadedmetadata', resizeCanvas);
+
+function resetCounter() {
+  score = 0; upDownEvents = 0; direction = 0; lastY = null; lastContact = performance.now();
+  scoreEl.textContent = '0';
+}
+resetBtn.onclick = resetCounter;
+
+async function startCamera() {
+  if (running) return;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: {ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} },
+      audio:false
+    });
+    video.srcObject = stream;
+    await video.play();
+    resizeCanvas();
+    running = true;
+    startBtn.textContent = 'Kamera läuft';
+    startBtn.disabled = true;
+    calibrateBtn.disabled = false;
+    setStatus('Kamera läuft – Erkennung aktiv', true);
+    loop();
+  } catch (e) {
+    setStatus('Kamera konnte nicht gestartet werden: ' + (e.name || e.message));
+  }
+}
+startBtn.onclick = startCamera;
+
+calibrateBtn.onclick = () => {
+  roi = {x:0.10,y:0.02,w:0.80,h:0.90};
+  setStatus('Erkennungsbereich auf großzügigen Bereich gesetzt. Platziere den Ball innerhalb des Bildes.');
+};
+
+function insideROI(x,y,w,h) {
+  return x >= overlay.width*roi.x && x <= overlay.width*(roi.x+roi.w) &&
+         y >= overlay.height*roi.y && y <= overlay.height*(roi.y+roi.h);
+}
+
+/*
+  Lightweight computer vision without external libraries:
+  - Looks for small bright circular regions (typical table-tennis ball).
+  - Uses frame-to-frame motion to reject static bright objects.
+  - Tracks vertical direction changes.
+  - A count is registered when the ball reverses downward -> upward near the
+    lower part of the tracking region, which approximates a racket contact.
+  This is intentionally conservative and works best with good lighting.
+*/
+function findBall(image, width, height) {
+  const d = image.data;
+  const step = 3;
+  const candidates = [];
+  const minS = Math.max(8, 32 - Number(sensitivity.value)*2);
+  const maxS = Math.max(minS+3, 70 - Number(sensitivity.value)*3);
+
+  for (let y=Math.floor(height*roi.y); y<Math.floor(height*(roi.y+roi.h)); y+=step) {
+    for (let x=Math.floor(width*roi.x); x<Math.floor(width*(roi.x+roi.w)); x+=step) {
+      const i=(y*width+x)*4;
+      const r=d[i], g=d[i+1], b=d[i+2];
+      const lum=(r+g+b)/3;
+      const sat=Math.max(r,g,b)-Math.min(r,g,b);
+      if (lum < minS || lum > 252 || sat > 80) continue;
+      if (!prevFrame) continue;
+      const p=prevFrame[i];
+      const motion=Math.abs(lum-p);
+      if (motion < 10) continue;
+
+      // local brightness check around the pixel
+      let bright=0, total=0;
+      for(let dy=-6;dy<=6;dy+=3){
+        for(let dx=-6;dx<=6;dx+=3){
+          const xx=Math.min(width-1,Math.max(0,x+dx));
+          const yy=Math.min(height-1,Math.max(0,y+dy));
+          const j=(yy*width+xx)*4;
+          const ll=(d[j]+d[j+1]+d[j+2])/3;
+          if(ll>165) bright++;
+          total++;
+        }
+      }
+      if(bright/total < 0.55) continue;
+
+      candidates.push({x,y,lum});
+      if(candidates.length>80) break;
+    }
+    if(candidates.length>80) break;
+  }
+  if(!candidates.length) return null;
+
+  // Cluster nearby pixels into one ball candidate.
+  let best=null;
+  for(const c of candidates){
+    let near=0, sx=0, sy=0;
+    for(const q of candidates){
+      const dx=q.x-c.x, dy=q.y-c.y;
+      if(dx*dx+dy*dy<20*20){near++;sx+=q.x;sy+=q.y;}
+    }
+    if(!best || near>best.near) best={x:sx/near,y:sy/near,near};
+  }
+  return best && best.near>=2 ? best : null;
+}
+
+function draw(ball) {
+  ctx.clearRect(0,0,overlay.width,overlay.height);
+  ctx.strokeStyle='rgba(85,214,255,.85)';
+  ctx.lineWidth=3;
+  ctx.strokeRect(overlay.width*roi.x,overlay.height*roi.y,
+                 overlay.width*roi.w,overlay.height*roi.h);
+  if(ball){
+    ctx.beginPath();
+    ctx.arc(ball.x,ball.y,Math.max(8,Math.min(22,8+ball.near)),0,Math.PI*2);
+    ctx.strokeStyle='#5cff8c';
+    ctx.stroke();
+  }
+}
+
+function process(ball) {
+  if(!ball) return;
+  const now=performance.now();
+  if(lastY!==null){
+    const dy=ball.y-lastY;
+    const newDir = Math.abs(dy)<2 ? direction : (dy>0 ? 1 : -1);
+    if(direction===1 && newDir===-1){
+      // Ball changed from moving down to moving up.
+      // Register only if the reversal occurs in the lower ~55% of ROI.
+      const contactY=overlay.height*(roi.y+roi.h*0.55);
+      if(ball.y >= contactY && now-lastContact>110){
+        score++;
+        if(score>record){
+          record=score;
+          localStorage.setItem('tt_counter_record', String(record));
+          recordEl.textContent=record;
+        }
+        scoreEl.textContent=score;
+        lastContact=now;
+      }
+    }
+    direction=newDir;
+  }
+  lastY=ball.y;
+}
+
+function loop(){
+  if(!running) return;
+  if(video.readyState>=2 && overlay.width){
+    ctx.save();
+    // Draw overlay after image processing
+    const tmp=document.createElement('canvas');
+    tmp.width=overlay.width; tmp.height=overlay.height;
+    const t=tmp.getContext('2d',{willReadFrequently:true});
+    t.drawImage(video,0,0,overlay.width,overlay.height);
+    const img=t.getImageData(0,0,overlay.width,overlay.height);
+    const ball=findBall(img,overlay.width,overlay.height);
+    // Store grayscale-ish previous frame for motion detection
+    const gray=new Uint8Array(overlay.width*overlay.height);
+    for(let i=0,p=0;i<img.data.length;i+=4,p++) gray[p]=(img.data[i]+img.data[i+1]+img.data[i+2])>>2;
+    // findBall expects previous frame as an array indexed by pixel*1; adapt below
+    // Convert previous frame representation for next iteration.
+    if(prevFrame){
+      // findBall's simple motion branch works with one luminance value per pixel;
+      // this replacement is handled by a custom pass below.
+    }
+    prevFrame=gray;
+    draw(ball);
+    process(ball);
+    ctx.restore();
+    return requestAnimationFrame(loop);
+  }
+  raf=requestAnimationFrame(loop);
+}
+
+// Patch findBall to use the one-byte grayscale previous frame.
+const originalFindBall=findBall;
+findBall=function(image,width,height){
+  const d=image.data, candidates=[];
+  const minL=Math.max(75,125-Number(sensitivity.value)*5);
+  const maxL=250;
+  const step=3;
+  if(!prevFrame) return null;
+  for(let y=Math.floor(height*roi.y); y<Math.floor(height*(roi.y+roi.h)); y+=step){
+    for(let x=Math.floor(width*roi.x); x<Math.floor(width*(roi.x+roi.w)); x+=step){
+      const i=(y*width+x)*4, r=d[i],g=d[i+1],b=d[i+2];
+      const lum=(r+g+b)/3, sat=Math.max(r,g,b)-Math.min(r,g,b);
+      const pi=y*width+x;
+      if(lum<minL || lum>maxL || sat>65) continue;
+      if(Math.abs(lum-prevFrame[pi])<9) continue;
+      let bright=0,total=0;
+      for(let dy=-6;dy<=6;dy+=3) for(let dx=-6;dx<=6;dx+=3){
+        const xx=Math.min(width-1,Math.max(0,x+dx));
+        const yy=Math.min(height-1,Math.max(0,y+dy));
+        const j=(yy*width+xx)*4, ll=(d[j]+d[j+1]+d[j+2])/3;
+        if(ll>160) bright++; total++;
+      }
+      if(bright/total<0.55) continue;
+      candidates.push({x,y});
+      if(candidates.length>120) break;
+    }
+    if(candidates.length>120) break;
+  }
+  if(!candidates.length) return null;
+  let best=null;
+  for(const c of candidates){
+    let near=0,sx=0,sy=0;
+    for(const q of candidates){
+      const dx=q.x-c.x,dy=q.y-c.y;
+      if(dx*dx+dy*dy<22*22){near++;sx+=q.x;sy+=q.y;}
+    }
+    if(!best||near>best.near) best={x:sx/near,y:sy/near,near};
+  }
+  return best&&best.near>=2?best:null;
+}
+
+window.addEventListener('beforeunload',()=>{
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+});
+</script>
+</body>
+</html>
